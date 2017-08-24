@@ -1,0 +1,337 @@
+---
+title: "Fitting dynamic occupancy models in TMB"
+author: "O. Gimenez"
+date: '`r Sys.time()`'
+output:
+  html_document: default
+---
+
+# Motivation
+
+Following my recent attempt to [fit a HMM model to capture-recapture data with TMB](https://oliviergimenez.github.io/post/multievent_in_tmb/) and the rather estonishing outcome (the code was > 300 time faster than the equivalent R implementation!), I was curious to add TMB to the [list of options I tried to fit dynamic occupancy models](https://oliviergimenez.github.io/post/occupancy_in_admb/). The reasons were the same as before: TMB is fast, allows for parallel computations, works with R, accomodates spatial stuff, allows easy implementation of random effects).
+
+I found materials on the internet to teach myself TMB, at least what I needed to implement a simple HMM model. See [here](http://seananderson.ca/2014/10/17/tmb.html) for a linear regression and a Gompertz state space model examples, [here](https://www.youtube.com/watch?v=A5CLrhzNzVU) for the same linear regression example on Youtube (that's awesome!) and many other examples [here](http://kaskr.github.io/adcomp/examples.html). 
+
+Below I first simulate some data (1000 sites, 20 years and 5 surveys per year), then fit a dynamic model using TMB, ADMB, JAGS and Unmarked and finally perform a quick benchmarking. I won't go into the details, instead I refer to [my previous post](https://oliviergimenez.github.io/post/occupancy_in_admb/).
+
+```{r message=FALSE, warning=FALSE}
+R = 1000 # number of sites
+J = 5 # number of replicate surveys/visits
+K = 20 # number of years/seasons
+psi1 = 0.6 # occupancy prob in first year/season
+p = 0.7 # detection prob
+epsilon = 0.5 # extinction prob
+gamma = 0.3 # colonization prob
+real_param = c(psi1,gamma,epsilon,p)
+
+# pre-allocate memory
+site <- 1:R # Sites
+year <- 1:K # Years
+psi <- rep(NA, K) # Occupancy probability
+muZ <- z <- array(dim = c(R, K)) # Expected and realized occurrence
+y <- array(NA, dim = c(R, J, K)) # Detection histories
+
+# define state process
+# first year/season
+z[,1] <- rbinom(R, 1, psi1) # Initial occupancy state
+# subsequent years/seasons
+for(i in 1:R){ # Loop over sites
+	for(k in 2:K){ # Loop over years
+		muZ[k] <- z[i, k-1]*(1-epsilon) + (1-z[i, k-1])*gamma # Prob for occ.
+		z[i,k] <- rbinom(1, 1, muZ[k])
+		}
+}
+
+# define observation process
+for(i in 1:R){
+	for(k in 1:K){
+		prob <- z[i,k] * p
+		for(j in 1:J){
+			y[i,j,k] <- rbinom(1, 1, prob)
+			}
+		}
+}
+
+# format data
+yy <- matrix(y, R, J*K)
+
+# various quantities
+nh <- nrow(yy) # nb sites
+eff = rep(1,nh) # nb sites with this particular history
+garb = yy[,1] # initial states
+
+# primary and secondary occasions
+primary = seq(J,J*K,by=J)
+secondary = 1:(J*K)
+secondary_bis = secondary[-primary]
+
+# further various quantities that will be useful later on
+K <- length(primary)
+J2 <- length(secondary)
+J <- J2/K
+N <- J * K
+JJ <- length(secondary_bis) # Number of time intervals between primary occasions
+
+# list of data
+df = list(K=K,N=N,JJ=JJ,nh=nh,e=garb,data=yy,eff=eff,primary=primary,secondarybis=secondary_bis)
+params <- list(logit_psi = 0, logit_det = 0, logit_gam = 0, logit_eps = 0) ## starting parameters
+
+#----- ADMB
+
+library(R2admb)
+model <- 
+paste("
+DATA_SECTION
+ init_int K // Number of seasons
+ init_int N // Number of seasons x surveys
+ init_int JJ // Number of time intervals between primary occasions
+ init_int nh // Number of sites
+ init_ivector e(1,nh) // Date of first capture
+ init_imatrix data(1,nh,1,N) // Data matrix
+ init_ivector eff(1,nh) // Number of individuals per capture history
+ init_ivector primary(1,K) // seasons
+ init_ivector secondarybis(1,JJ) // time intervals between primary occasions
+PARAMETER_SECTION
+ init_bounded_number logit_psi(-20.0,20.0,1) // init occupancy
+ init_bounded_number logit_det(-20.0,20.0,1) // detection
+ init_bounded_number logit_gam(-20.0,20.0,1) // colonization
+ init_bounded_number logit_eps(-20.0,20.0,1) // extinction
+ objective_function_value g
+// number psi
+// number det
+// number gam
+// number eps
+ sdreport_number psi
+ sdreport_number det
+ sdreport_number gam
+ sdreport_number eps
+ PROCEDURE_SECTION
+ psi = mfexp(logit_psi);
+ psi = psi/(1+psi); 
+ det = mfexp(logit_det);
+ det = det/(1+det); 
+ gam = mfexp(logit_gam);
+ gam = gam/(1+gam); 
+ eps = mfexp(logit_eps);
+ eps = eps/(1+eps); 
+ dvar_vector prop(1,2);
+ prop(1) = 1-psi; prop(2) = psi;
+ dvar_matrix B(1,2,1,2);
+ B(1,1) = 1;
+ B(1,2) = 1-det;
+ B(2,1) = 0.0;
+ B(2,2) = det;
+ dvar3_array PHI(1,N,1,2,1,2);
+ for(int i=1;i<=K;i++){
+ 	PHI(primary(i),1,1) = 1-gam;
+ 	PHI(primary(i),1,2) = gam;
+ 	PHI(primary(i),2,1) = eps;
+ 	PHI(primary(i),2,2) = 1-eps;
+ }
+ for(int j=1;j<=JJ;j++){
+ 	PHI(secondarybis(j),1,1) = 1;
+ 	PHI(secondarybis(j),1,2) = 0;
+ 	PHI(secondarybis(j),2,1) = 0;
+ 	PHI(secondarybis(j),2,2) = 1;
+ }
+
+ for(int i=1;i<=nh;i++){
+ 	int oe = e(i) + 1; // initial obs
+ 	ivector evennt = data(i)+1; //
+ 	dvar_vector ALPHA = elem_prod(prop,B(oe));
+ 	for(int j=2;j<=N;j++){
+ 		ALPHA = elem_prod(ALPHA*PHI(j-1),B(evennt(j)));
+ 		g -= log(sum(ALPHA))*eff(i);
+ 	}
+ }
+")
+writeLines(model,"model.tpl")
+setup_admb("/Applications/ADMBTerminal.app/admb")
+
+#---- Unmarked
+
+library(unmarked)
+simUMF <- unmarkedMultFrame(y = yy,numPrimary=K)
+
+#---- JAGS
+
+library(jagsUI)
+model <- 
+paste("
+    model{
+    #priors
+    p ~ dunif(0,1)
+    psi1 ~ dunif(0,1)
+    epsilon ~ dunif(0,1)
+    gamma~dunif(0,1)
+   
+    for(i in 1:n.sites){
+        # process
+        z[i,1] ~ dbern(psi1)
+        for(t in 2:n.seasons){ 
+            mu[i,t]<-((1-epsilon)*z[i,t-1])+(gamma*(1-z[i,t-1]))
+            z[i,t]~dbern(mu[i,t])
+        }
+        # obs
+        for(t in 1:n.seasons){ 
+            for(j in 1:n.occas){
+                p.eff[i,j,t] <- z[i,t]*p
+                y[i,j,t]~dbern(p.eff[i,j,t])
+            }
+        }
+    }
+}
+")
+writeLines(model,"dynocc.txt")
+
+jags.data <- list(y=y,n.seasons=dim(y)[3],n.occas=dim(y)[2],n.sites=dim(y)[1])
+z.init <- apply(jags.data$y,c(1,3),max)
+initial <- function()list(p=runif(1,0,1),psi1=runif(1,0,1),z=z.init,epsilon=runif(1,0,1),gamma=runif(1,0,1))
+params.to.monitor <- c("psi1","gamma","epsilon","p")
+inits <- list(initial(),initial())
+
+#---- TMB
+
+library(TMB)
+
+model <- 
+paste("
+#include <TMB.hpp>
+
+/* implement the vector - matrix product */
+template<class Type>
+vector<Type> multvecmat(array<Type>  A, matrix<Type>  B) {
+  int nrowb = B.rows();
+  int ncolb = B.cols(); 
+  vector<Type> C(ncolb);
+  for (int i = 0; i < ncolb; i++)
+  {
+	    C(i) = Type(0);
+      for (int k = 0; k < nrowb; k++){
+        C(i) += A(k)*B(k,i);
+    }
+  }
+  return C;
+}
+
+template<class Type>
+Type objective_function<Type>::operator() () {
+  
+  // b = parameters
+  PARAMETER_VECTOR(b);
+  
+  // data
+  DATA_IMATRIX(ch); // ch = site histories
+  DATA_IVECTOR(e); // e = init state 
+  DATA_IVECTOR(primary); // seasons
+  DATA_IVECTOR(secondarybis); // time intervals between primary occasions 
+  
+  int nh = ch.rows(); // nb of sites
+  int N = ch.cols(); // nb of seasons x surveys
+  int JJ = secondarybis.size(); // nb of time intervals between primary occasions
+  int K = primary.size(); // nb of seasons
+  
+  int npar = b.size();
+
+  vector<Type> par(npar);
+  for (int i = 0; i < npar; i++) {
+    par(i) = Type(1.0) / (Type(1.0) + exp(-b(i)));
+  }
+  Type psi = par(0); // init occupancy
+  Type det = par(1); // detection
+  Type gam = par(2); // col
+  Type eps = par(3); // ext
+  // careful, indexing starts at 0!
+  
+  // init states - occ
+  vector<Type> PROP(2);
+  PROP(0) = Type(1.0)-psi;
+  PROP(1) = psi;
+
+  // obs
+  matrix<Type> B(2,2);
+  B(0,0) = Type(1.0);
+  B(0,1) = Type(1.0) - det;
+  B(1,0) = Type(0.0);
+  B(1,1) = det;
+
+  // transition
+  array<Type> PHI(2,2,N);
+  for (int i = 0; i < K; i++) {
+    PHI(0,0,primary(i)) = Type(1.0) - gam;
+    PHI(0,1,primary(i)) = gam;
+    PHI(1,0,primary(i)) = eps;
+    PHI(1,1,primary(i)) = Type(1.0) - eps;
+  }
+  
+  for (int j = 0; j < JJ; j++) {
+    PHI(0,0,secondarybis(j)) = Type(1.0);
+    PHI(0,1,secondarybis(j)) = Type(0.0);
+    PHI(1,0,secondarybis(j)) = Type(0.0);
+    PHI(1,1,secondarybis(j)) = Type(1.0);
+  }
+
+  REPORT(PHI);
+  
+  // likelihood
+  Type ll(0);
+  Type nll(0);
+  array<Type> ALPHA(2);
+  for (int i = 0; i < nh; i++) {
+    vector<int> evennt = ch.row(i);
+    ALPHA = PROP * vector<Type>(B.row(e(i))); // element-wise vector product
+    REPORT(ALPHA);
+    for (int j = 1; j < N; j++) {
+      matrix<Type> TEMP = PHI.col(j-1);
+      matrix<Type> PHIj(2,2);
+      PHIj(0,0) = TEMP(0,0);
+      PHIj(0,1) = TEMP(1,0);
+      PHIj(1,0) = TEMP(2,0);
+      PHIj(1,1) = TEMP(3,0);
+      ALPHA = multvecmat(ALPHA,PHIj)* vector<Type>(B.row(evennt(j))); // vector matrix product, then element-wise vector product
+    }
+    ll += log(sum(ALPHA));
+  }
+  nll = -ll;
+  return nll;
+}
+")
+writeLines(model,"occ_tmb.cpp")
+
+# compile
+compile("occ_tmb.cpp")
+
+# load
+dyn.load(dynlib("occ_tmb"))
+
+# inits
+binit = rep(0,4)
+
+# match model/data
+f <- MakeADFun(
+  data = list(ch = yy, e = garb, primary=primary-1,secondarybis=secondary_bis-1), 
+  parameters = list(b = binit),
+  DLL = "occ_tmb")
+
+## fit the model (optimization)
+#opt <- do.call("optim", f)
+#opt
+#sdreport(f) # get SEs
+
+#----- benchmarking!
+
+library(microbenchmark)
+res = microbenchmark(
+do_admb('model', data=df, params = params),
+colext(psiformula= ~1, gammaformula = ~ 1, epsilonformula = ~ 1,pformula = ~ 1, data = simUMF, method="BFGS",se=FALSE),
+jagsUI(data=jags.data, inits, parameters.to.save=params.to.monitor, model.file="dynocc.txt",n.thin = 1,n.chains = 2, n.burnin = 500, n.iter =1000,parallel=TRUE),
+do.call("optim", f),times=3)
+res2 = summary(res)
+res2
+```
+
+The results are amazing! TMB is `r res2$median[1]/res2$median[4]` faster than ADMB, `r res2$median[2]/res2$median[4]` than Unmarked and `r res2$median[3]/res2$median[4]` faster than Jags. 
+
+# Conclusions
+
+I'm new to TMB, but I'm gonna definitely dig into it. Congrats to the developers!
